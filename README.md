@@ -2,7 +2,7 @@
 
 ## You can use the app at https://shiny-r.dev/find_estat/
 
-A small Shiny app for quickly finding relevant Eurostat datasets and tables by searching the Eurostat catalogue, the Eurostat data-group hierarchy, dataset/table names, and dataset/table codes.
+A small **[R](https://www.r-project.org/)/[Shiny](https://CRAN.R-project.org/package=shiny)** app for quickly finding relevant Eurostat datasets and tables by searching the Eurostat catalogue, the Eurostat data-group hierarchy, dataset/table names, and dataset/table codes.
 
 The app is meant for users who know roughly what they want to study, but do not yet know the exact Eurostat dataset code. It returns matching codes, update metadata, direct Eurostat Data Browser links, and one-click `explain` links that open a ChatGPT prompt for the selected code.
 
