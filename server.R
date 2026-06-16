@@ -1,3 +1,5 @@
+if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
+
 library(shiny)
 library(data.table)
 library(DT)
@@ -8,7 +10,7 @@ REQUIRED_TOC_COLUMNS <- c(
   "last.table.structure.change", "data.start", "data.end"
 )
 INTERNAL_COLUMNS <- c("LastUpdateDate", "LastStructDate", "SearchTextLower", "CodeLower")
-SEARCH_PROMPT <- "Enter filtering condition(s)/text in the search field(s), then click the Update View button."
+SEARCH_PROMPT <- HTML("<h5>Enter filtering condition(s)/text in the search field(s), then click the Update View button or press Enter in a search field.</h5>")
 
 myRecursFill <- eurodata:::myRecursFill
 
@@ -48,13 +50,10 @@ has_toc_columns <- function(dt) {
   !is.null(dt) && all(REQUIRED_TOC_COLUMNS %chin% names(dt))
 }
 
-read_toc <- function(url = TOC_URL) {
-  raw <- readLines(url, encoding = "UTF-8", warn = FALSE)
-  raw <- gsub(" \t \t", "\t", raw, fixed = TRUE)
-  text <- paste(raw, collapse = "\n")
-
-  dt <- tryCatch(
-    fread(
+parse_toc_candidate <- function(text, method) {
+  switch(
+    method,
+    fread_tab = fread(
       text = text,
       sep = "\t",
       header = TRUE,
@@ -64,29 +63,72 @@ read_toc <- function(url = TOC_URL) {
       showProgress = FALSE,
       check.names = TRUE
     ),
-    error = function(e) NULL
-  )
-
-  if (!is.null(dt)) normalise_toc_names(dt)
-
-  if (!has_toc_columns(dt)) {
-    dt <- as.data.table(utils::read.delim(
+    fread_space = fread(
       text = text,
+      sep = " ",
+      header = TRUE,
+      quote = "\"",
+      encoding = "UTF-8",
+      fill = TRUE,
+      showProgress = FALSE,
+      check.names = TRUE
+    ),
+    fread_auto = fread(
+      text = text,
+      sep = "auto",
+      header = TRUE,
+      quote = "\"",
+      encoding = "UTF-8",
+      fill = TRUE,
+      showProgress = FALSE,
+      check.names = TRUE
+    ),
+    read_table = as.data.table(utils::read.table(
+      text = text,
+      header = TRUE,
+      sep = "",
+      quote = "\"",
       stringsAsFactors = FALSE,
       check.names = TRUE,
-      quote = "\"",
       comment.char = "",
-      fill = TRUE
+      fill = TRUE,
+      blank.lines.skip = FALSE
     ))
+  )
+}
+
+read_toc <- function(url = TOC_URL) {
+  raw <- readLines(url, encoding = "UTF-8", warn = FALSE)
+  raw <- gsub(" \t \t", "\t", raw, fixed = TRUE)
+  text <- paste(raw, collapse = "\n")
+
+  errors <- character()
+  for (method in c("fread_tab", "fread_space", "fread_auto", "read_table")) {
+    parsed <- tryCatch(
+      list(dt = parse_toc_candidate(text, method), error = NULL),
+      error = function(e) list(dt = NULL, error = conditionMessage(e))
+    )
+
+    if (is.null(parsed$dt)) {
+      errors <- c(errors, paste0(method, ": ", parsed$error))
+      next
+    }
+
+    dt <- as.data.table(parsed$dt)
     normalise_toc_names(dt)
+    if (has_toc_columns(dt)) return(dt[])
+
+    errors <- c(
+      errors,
+      paste0(method, ": missing ", paste(setdiff(REQUIRED_TOC_COLUMNS, names(dt)), collapse = ", "))
+    )
   }
 
-  missing <- setdiff(REQUIRED_TOC_COLUMNS, names(dt))
-  if (length(missing)) {
-    stop("Eurostat TOC format changed. Missing column(s): ", paste(missing, collapse = ", "))
-  }
-
-  dt[]
+  stop(
+    "Eurostat TOC could not be parsed. Parse attempts: ",
+    paste(errors, collapse = " | "),
+    call. = FALSE
+  )
 }
 
 paste_columns <- function(dt, cols) {
@@ -193,16 +235,21 @@ has_any_term <- function(text, terms) {
   Reduce(`|`, lapply(terms, function(term) grepl(term, text, fixed = TRUE)))
 }
 
-criteria_from_input <- function(input) {
+criteria_from_values <- function(keyword = "", keyword2 = "", keyword3 = "") {
+  list(
+    whole = keyword,
+    code = keyword2,
+    exclude = keyword3
+  )
+}
+
+
+criteria_from_payload <- function(payload) {
   val <- function(id) {
-    x <- input[[id]]
+    x <- payload[[id]]
     if (is.null(x) || !length(x) || is.na(x[[1L]])) "" else x[[1L]]
   }
-  list(
-    whole = val("keyword"),
-    code = val("keyword2"),
-    exclude = val("keyword3")
-  )
+  criteria_from_values(val("keyword"), val("keyword2"), val("keyword3"))
 }
 
 criteria_has_terms <- function(criteria) {
@@ -252,6 +299,7 @@ make_anchor <- function(url, text) {
 
 make_display <- function(dt) {
   if (identical(dt, SEARCH_PROMPT)) return(data.table(Message = SEARCH_PROMPT))
+  if (identical(names(dt), "Message")) return(as.data.table(copy(dt)))
   if (!nrow(dt)) return(data.table(Message = "Nothing found"))
 
   out <- copy(dt)
@@ -269,6 +317,7 @@ make_display <- function(dt) {
 
 make_download <- function(dt) {
   if (identical(dt, SEARCH_PROMPT)) return(data.frame(Message = SEARCH_PROMPT))
+  if (identical(names(dt), "Message")) return(as.data.frame(copy(dt)))
   if (!nrow(dt)) return(data.frame(Message = "Nothing found"))
 
   out <- copy(dt)
@@ -298,6 +347,7 @@ make_filename <- function(criteria) {
 }
 
 results_datatable <- function(dt) {
+  if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
   html_cols <- c("Dataset name", "Link", "Explain")
   escape_cols <- if (identical(names(dt), "Message")) TRUE else which(!names(dt) %chin% html_cols)
 
@@ -320,6 +370,22 @@ results_datatable <- function(dt) {
 
 shinyServer(function(input, output, session) {
   catalogue_cache <- reactiveVal(NULL)
+  result_state <- reactiveVal(list(
+    data = SEARCH_PROMPT,
+    criteria = criteria_from_values(),
+    show_table = FALSE,
+    message = SEARCH_PROMPT,
+    error = FALSE
+  ))
+
+  observe({
+    invalidateLater(60000, session)
+    if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
+  })
+
+  set_spinner <- function(show) {
+    session$sendCustomMessage("findEstatSpinner", list(show = isTRUE(show)))
+  }
 
   get_catalogue <- function() {
     cached <- catalogue_cache()
@@ -329,42 +395,85 @@ shinyServer(function(input, output, session) {
     dt
   }
 
-  filtered_result <- reactive({
-    criteria <- criteria_from_input(input)
+  set_prompt_state <- function(criteria) {
+    result_state(list(
+      data = SEARCH_PROMPT,
+      criteria = criteria,
+      show_table = FALSE,
+      message = SEARCH_PROMPT,
+      error = FALSE
+    ))
+  }
+
+  run_search <- function(criteria) {
+    if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
+    on.exit(set_spinner(FALSE), add = TRUE)
+
     if (!criteria_has_terms(criteria)) {
-      return(list(data = SEARCH_PROMPT, criteria = criteria))
+      set_prompt_state(criteria)
+      return(invisible(NULL))
     }
 
-    data <- withProgress(message = "Preparing Eurostat catalogue", value = 0, {
+    state <- tryCatch({
       dt <- get_catalogue()
-      incProgress(0.8, detail = "Filtering results")
-      filter_catalogue(dt, criteria)
+      data <- filter_catalogue(dt, criteria)
+      list(
+        data = data,
+        criteria = criteria,
+        show_table = TRUE,
+        message = NULL,
+        error = FALSE
+      )
+    }, error = function(e) {
+      msg <- paste("Search failed:", conditionMessage(e))
+      list(
+        data = data.table(Message = msg),
+        criteria = criteria,
+        show_table = FALSE,
+        message = msg,
+        error = TRUE
+      )
     })
-    list(data = data, criteria = criteria)
-  })
+
+    result_state(state)
+    invisible(NULL)
+  }
+
+  observeEvent(input$searchCriteria, {
+    run_search(criteria_from_payload(input$searchCriteria))
+  }, ignoreInit = TRUE)
 
   output$results <- renderUI({
-    criteria <- criteria_from_input(input)
-    if (!criteria_has_terms(criteria)) {
-      return(tags$p(SEARCH_PROMPT))
+    state <- result_state()
+    if (isTRUE(state$show_table)) return(DTOutput("df"))
+
+    if (isTRUE(state$error)) {
+      return(tags$p(state$message, class = "text-danger"))
     }
-    DTOutput("df")
+
+    msg <- state$message
+    if (is.null(msg) || !nzchar(msg)) msg <- SEARCH_PROMPT
+    tags$p(msg)
   })
 
   output$df <- renderDT({
-    req(criteria_has_terms(criteria_from_input(input)))
-    results_datatable(make_display(filtered_result()$data))
-  }, server = TRUE)
+    state <- result_state()
+    tryCatch(
+      results_datatable(make_display(state$data)),
+      error = function(e) results_datatable(data.table(Message = paste("Table rendering failed:", conditionMessage(e))))
+    )
+  }, server = FALSE)
 
   output$downloadData <- downloadHandler(
     filename = function() {
-      make_filename(filtered_result()$criteria)
+      make_filename(result_state()$criteria)
     },
     content = function(file) {
+      if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
       if (!requireNamespace("openxlsx", quietly = TRUE)) {
         stop("The openxlsx package is required for XLSX downloads.")
       }
-      openxlsx::write.xlsx(make_download(filtered_result()$data), file, overwrite = TRUE, asTable = TRUE)
+      openxlsx::write.xlsx(make_download(result_state()$data), file, overwrite = TRUE, asTable = TRUE)
     }
   )
 })
