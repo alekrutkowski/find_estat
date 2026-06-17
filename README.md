@@ -4,7 +4,7 @@
 
 A small **[R](https://www.r-project.org/)/[Shiny](https://CRAN.R-project.org/package=shiny)** app for quickly finding relevant Eurostat datasets and tables by searching the Eurostat catalogue, the Eurostat data-group hierarchy, dataset/table names, and dataset/table codes.
 
-The app is meant for users who know roughly what they want to study, but do not yet know the exact Eurostat dataset code. It returns matching codes, update metadata, direct Eurostat Data Browser links, and one-click `explain` links that open a ChatGPT prompt for the selected code.
+The app is meant for users who know roughly what they want to study, but do not yet know the exact Eurostat dataset code. It returns matching codes, qualitative size classes, update metadata, direct Eurostat Data Browser links, and one-click `explain` links that open a ChatGPT prompt for the selected code.
 
 ## What it does
 
@@ -18,6 +18,7 @@ The app is meant for users who know roughly what they want to study, but do not 
 - Ignores upper/lower case differences.
 - Treats space-separated search words as literal terms, not regular expressions.
 - Opens matching datasets/tables in the Eurostat Data Browser.
+- Adds a static `Size` column based on the Eurostat TOC `values` field, classified into quintile-based qualitative classes.
 - Adds an `Explain` column whose link text is lower-case `explain` and whose URL opens a ChatGPT prompt for the dataset/table code.
 - Downloads the current search result as an XLSX file with hyperlink columns preserved.
 
@@ -52,14 +53,16 @@ The DataTables built-in search boxes are disabled on purpose. The intended workf
 
 This app is designed to avoid repeated expensive work during one user session.
 
-- The Eurostat TOC is downloaded lazily, only after the first non-empty search.
-- During a Shiny session, the parsed catalogue is cached in a session-local `reactiveVal()`.
+- The Eurostat TOC download/preparation is started asynchronously with `mirai` daemons as soon as a user session opens.
+- The download/preparation is started only once per Shiny session and the parsed catalogue, including the static quintile-based `Size` classification, is cached in a session-local `reactiveVal()`.
 - The catalogue is stored and filtered with `data.table`.
 - Display and download tables are made from defensive `copy()` calls before mutating columns, because `data.table` updates columns by reference when using `:=`.
 - The hierarchy fill intentionally uses `eurodata:::myRecursFill`, because the native R alternative was too slow for the old app's workload.
+- `mirai` daemons are pre-launched at app startup, which avoids the per-search worker start-up cost of launching fresh background R processes.
+- The default daemon count is bounded at four local daemons and can be overridden with the `FIND_ESTAT_MIRAI_DAEMONS` environment variable.
 - The result table uses DataTables server-side rendering and deferred rendering.
 
-The first real search can still take longer than later searches, because it downloads and prepares the catalogue. Later searches in the same user session reuse the cached catalogue.
+If the user searches before the asynchronous preparation has finished, the submitted search is queued and runs automatically as soon as the session-local catalogue cache is ready. Later searches in the same user session reuse the cached catalogue.
 
 ## Requirements
 
@@ -72,7 +75,9 @@ install.packages(c(
   "DT",
   "htmltools",
   "openxlsx",
-  "eurodata"
+  "eurodata",
+  "promises",
+  "mirai"
 ))
 ```
 
@@ -80,6 +85,7 @@ Notes:
 
 - `openxlsx` is needed for Excel export.
 - `eurodata` is needed because `server.R` intentionally calls the non-exported helper `eurodata:::myRecursFill`.
+- `promises` and `mirai` are needed for the asynchronous, non-blocking Eurostat catalogue preparation.
 - Because `myRecursFill` is accessed with `:::`, it is not part of a guaranteed public API. For stable deployments, pin package versions with `renv` or another reproducibility tool.
 - On Windows, source installs of packages with compiled code may require Rtools. CRAN binaries usually avoid this for common R versions.
 
@@ -97,7 +103,7 @@ Or from another working directory:
 shiny::runApp("path/to/find_estat")
 ```
 
-The machine running the app needs internet access so it can download the Eurostat TOC on the first submitted search in each session.
+The machine running the app needs internet access so it can start downloading and preparing the Eurostat TOC when each session opens.
 
 ## Repository layout
 
@@ -112,7 +118,7 @@ The machine running the app needs internet access so it can download the Eurosta
 
 `ui.R` defines the page layout, the three search boxes, the original submit-style **Update View** button, the download button, and the results area.
 
-`server.R` downloads and parses the Eurostat TOC, builds the hierarchical catalogue, caches it per session, applies the search criteria, formats links, renders the table, and writes XLSX downloads.
+`server.R` starts local `mirai` daemons at app startup, launches the Eurostat TOC download/parsing asynchronously when a session opens, builds the hierarchical catalogue, calculates the static `Size` class from the Eurostat TOC `values` field, caches the result per session, applies the search criteria, formats links, renders the table, and writes XLSX downloads.
 
 ## Search semantics
 
@@ -143,6 +149,7 @@ Typical result columns include:
 - `Data subgroup, level 1`, `Data subgroup, level 2`, and deeper levels where present: hierarchical Eurostat topic context.
 - `Dataset name`: dataset or table title.
 - `Code`: Eurostat dataset/table code.
+- `Size`: qualitative class based on the Eurostat TOC `values` field. The classes are `very small`, `small`, `medium`, `large`, and `very large`, using the 20th, 40th, 60th, and 80th percentiles of dataset/table `values` as thresholds.
 - `Last update of data`: latest data update date, formatted as `YYYY.MM.DD`.
 - `Last table structure change`: latest structural update date, formatted as `YYYY.MM.DD`.
 - `Data start` and `Data end`: available data range from the TOC.
@@ -178,9 +185,9 @@ Commit `renv.lock` with the app.
 
 ## Troubleshooting
 
-### The first search is slow
+### The first search says the catalogue is still loading
 
-The first submitted search downloads and parses the Eurostat TOC. Later searches in the same session should be faster because the prepared catalogue is cached.
+This can happen if the user submits a search before the background Eurostat TOC download/preparation has finished. The submitted search is kept and runs automatically when the prepared catalogue is cached for that session.
 
 ### The app starts but shows no table
 
@@ -192,6 +199,14 @@ Install or deploy the `eurodata` package:
 
 ```r
 install.packages("eurodata")
+```
+
+### `there is no package called 'mirai'`
+
+Install or deploy the `mirai` package:
+
+```r
+install.packages("mirai")
 ```
 
 ### `object 'myRecursFill' not found` or a similar error
@@ -216,7 +231,7 @@ The app checks for required TOC columns. If Eurostat changes the TXT schema, upd
 
 ## Privacy notes
 
-The app sends a request to Eurostat only when a search is run and the session cache is empty. The `Explain` link does not send anything from the Shiny server to ChatGPT; it is only a hyperlink containing the selected Eurostat dataset/table code. When clicked, it opens ChatGPT in the user's browser.
+The app sends a request to Eurostat when each Shiny session opens, so the catalogue can be prepared in a `mirai` background daemon before the first search. The `Explain` link does not send anything from the Shiny server to ChatGPT; it is only a hyperlink containing the selected Eurostat dataset/table code. When clicked, it opens ChatGPT in the user's browser.
 
 ## Maintenance checklist
 
@@ -224,6 +239,7 @@ Before publishing a new release:
 
 - Open the app and confirm that the initial page shows the guidance message rather than the full catalogue.
 - Run a broad search and confirm that results appear after one click on **Update View**.
+- Confirm that the `Size` column is present and contains only `very small`, `small`, `medium`, `large`, or `very large` for rows with a usable Eurostat TOC `values` entry.
 - Confirm that the `Link` column opens Eurostat Data Browser pages.
 - Confirm that the `Explain` column displays `explain` and opens the expected prompt URL.
 - Download an XLSX file and verify that the hyperlink columns work.

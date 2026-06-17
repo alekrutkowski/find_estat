@@ -86,7 +86,7 @@ shinyUI(fluidPage(
 
         if (window.jQuery) {
           jQuery(document).on('shiny:connected', registerSpinnerHandler);
-          jQuery(document).on('shiny:idle shiny:disconnected', function() {
+          jQuery(document).on('shiny:disconnected', function() {
             setSpinner(false);
           });
         }

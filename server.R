@@ -3,14 +3,33 @@ if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
 library(shiny)
 library(data.table)
 library(DT)
+library(promises)
+library(mirai)
+
+default_mirai_daemons <- function() {
+  cores <- parallel::detectCores(logical = FALSE)
+  if (is.na(cores) || cores < 2L) return(1L)
+  max(1L, min(4L, cores - 1L))
+}
+
+configured_daemons <- suppressWarnings(as.integer(Sys.getenv(
+  "FIND_ESTAT_MIRAI_DAEMONS",
+  unset = NA_character_
+)))
+if (is.na(configured_daemons) || configured_daemons < 1L) {
+  configured_daemons <- default_mirai_daemons()
+}
+MIRAI_DAEMONS <- configured_daemons
+mirai::daemons(MIRAI_DAEMONS)
+shiny::onStop(function() mirai::daemons(0))
 
 TOC_URL <- "https://ec.europa.eu/eurostat/api/dissemination/catalogue/toc/txt?lang=EN"
 REQUIRED_TOC_COLUMNS <- c(
-  "title", "code", "type", "last.update.of.data",
+  "title", "code", "type", "values", "last.update.of.data",
   "last.table.structure.change", "data.start", "data.end"
 )
 INTERNAL_COLUMNS <- c("LastUpdateDate", "LastStructDate", "SearchTextLower", "CodeLower")
-SEARCH_PROMPT <- HTML("<h5>Enter filtering condition(s)/text in the search field(s), then click the Update View button or press Enter in a search field.</h5>")
+SEARCH_PROMPT <- HTML("<h5>The Eurostat catalogue starts loading in the background when this page opens. Enter filtering condition(s)/text in the search field(s), then click the Update View button or press Enter in a search field.</h5>")
 
 myRecursFill <- eurodata:::myRecursFill
 
@@ -39,6 +58,34 @@ format_toc_date <- function(x) {
   y <- format(x, "%Y.%m.%d")
   y[is.na(x)] <- ""
   y
+}
+
+parse_toc_values <- function(x) {
+  x <- gsub("\\s+", "", trim_text(x), perl = TRUE)
+  x <- gsub(",", "", x, fixed = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+
+classify_size <- function(x) {
+  labels <- c("very small", "small", "medium", "large", "very large")
+  out <- rep("", length(x))
+  ok <- !is.na(x)
+  if (!any(ok)) return(out)
+
+  thresholds <- as.numeric(stats::quantile(
+    x[ok],
+    probs = c(0.2, 0.4, 0.6, 0.8),
+    na.rm = TRUE,
+    names = FALSE,
+    type = 7
+  ))
+
+  out[ok] <- labels[5L]
+  out[ok & x <= thresholds[4L]] <- labels[4L]
+  out[ok & x <= thresholds[3L]] <- labels[3L]
+  out[ok & x <= thresholds[2L]] <- labels[2L]
+  out[ok & x <= thresholds[1L]] <- labels[1L]
+  out
 }
 
 normalise_toc_names <- function(dt) {
@@ -155,13 +202,13 @@ make_explain_url <- function(code) {
 
 build_catalogue <- function(url = TOC_URL) {
   raw <- read_toc(url)
-  if ("values" %chin% names(raw)) raw[, values := NULL]
 
   raw[, `:=`(
     id = .I,
     level = toc_level(title),
     title_clean = clean_title(title),
     type_clean = tolower(trim_text(type)),
+    ValuesCount = parse_toc_values(values),
     LastUpdateDate = parse_toc_date(last.update.of.data),
     LastStructDate = parse_toc_date(last.table.structure.change)
   )]
@@ -195,6 +242,7 @@ build_catalogue <- function(url = TOC_URL) {
 
   meta <- raw[keep, .(
     Code = trim_text(code),
+    Size = classify_size(ValuesCount),
     `Last update of data` = format_toc_date(LastUpdateDate),
     `Last table structure change` = format_toc_date(LastStructDate),
     `Data start` = trim_text(data.start),
@@ -211,10 +259,45 @@ build_catalogue <- function(url = TOC_URL) {
     CodeLower = tolower(Code)
   )]
   setcolorder(out, c(
-    names(hierarchy), "Code", "Last update of data", "Last table structure change",
+    names(hierarchy), "Code", "Size", "Last update of data", "Last table structure change",
     "Data start", "Data end", "Link", "Explain", INTERNAL_COLUMNS
   ))
   out[]
+}
+
+catalogue_worker_environment <- function() {
+  env <- new.env(parent = globalenv())
+  fn_names <- c(
+    "build_catalogue", "read_toc", "parse_toc_candidate",
+    "normalise_toc_names", "has_toc_columns", "paste_columns",
+    "toc_level", "clean_title", "trim_text", "parse_toc_date",
+    "format_toc_date", "parse_toc_values", "classify_size",
+    "encode_url_piece", "make_browser_url", "make_explain_url"
+  )
+
+  for (nm in fn_names) assign(nm, get(nm, mode = "function"), envir = env)
+  env$TOC_URL <- TOC_URL
+  env$REQUIRED_TOC_COLUMNS <- REQUIRED_TOC_COLUMNS
+  env$INTERNAL_COLUMNS <- INTERNAL_COLUMNS
+  env$myRecursFill <- myRecursFill
+
+  for (nm in fn_names) environment(env[[nm]]) <- env
+  env
+}
+
+launch_catalogue_download <- function(url = TOC_URL) {
+  worker_env <- catalogue_worker_environment()
+
+  promises::as.promise(mirai::mirai(
+    {
+      if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
+      library(data.table)
+      library(eurodata)
+      build_catalogue(url)
+    },
+    url = url,
+    build_catalogue = worker_env$build_catalogue
+  ))
 }
 
 split_terms <- function(x) {
@@ -370,6 +453,11 @@ results_datatable <- function(dt) {
 
 shinyServer(function(input, output, session) {
   catalogue_cache <- reactiveVal(NULL)
+  catalogue_error <- reactiveVal(NULL)
+  catalogue_started <- FALSE
+  catalogue_promise <- NULL
+  search_serial <- 0L
+
   result_state <- reactiveVal(list(
     data = SEARCH_PROMPT,
     criteria = criteria_from_values(),
@@ -387,15 +475,8 @@ shinyServer(function(input, output, session) {
     session$sendCustomMessage("findEstatSpinner", list(show = isTRUE(show)))
   }
 
-  get_catalogue <- function() {
-    cached <- catalogue_cache()
-    if (!is.null(cached)) return(cached)
-    dt <- build_catalogue()
-    catalogue_cache(dt)
-    dt
-  }
-
   set_prompt_state <- function(criteria) {
+    set_spinner(FALSE)
     result_state(list(
       data = SEARCH_PROMPT,
       criteria = criteria,
@@ -405,17 +486,19 @@ shinyServer(function(input, output, session) {
     ))
   }
 
-  run_search <- function(criteria) {
-    if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
-    on.exit(set_spinner(FALSE), add = TRUE)
+  set_search_error <- function(criteria, message) {
+    set_spinner(FALSE)
+    result_state(list(
+      data = data.table(Message = message),
+      criteria = criteria,
+      show_table = FALSE,
+      message = message,
+      error = TRUE
+    ))
+  }
 
-    if (!criteria_has_terms(criteria)) {
-      set_prompt_state(criteria)
-      return(invisible(NULL))
-    }
-
+  complete_search <- function(dt, criteria) {
     state <- tryCatch({
-      dt <- get_catalogue()
       data <- filter_catalogue(dt, criteria)
       list(
         data = data,
@@ -436,8 +519,98 @@ shinyServer(function(input, output, session) {
     })
 
     result_state(state)
+    set_spinner(FALSE)
     invisible(NULL)
   }
+
+  start_catalogue_download <- function() {
+    if (catalogue_started) return(invisible(catalogue_promise))
+
+    catalogue_started <<- TRUE
+    catalogue_error(NULL)
+
+    catalogue_promise <<- launch_catalogue_download()
+
+    promises::then(
+      catalogue_promise,
+      onFulfilled = function(dt) {
+        catalogue_cache(dt)
+        catalogue_error(NULL)
+        catalogue_promise <<- NULL
+        dt
+      },
+      onRejected = function(e) {
+        catalogue_error(conditionMessage(e))
+        catalogue_promise <<- NULL
+        NULL
+      }
+    )
+
+    invisible(catalogue_promise)
+  }
+
+  queue_search_after_catalogue <- function(criteria, serial) {
+    message <- "Eurostat catalogue is still loading. Your search will run automatically as soon as it is ready."
+    set_spinner(TRUE)
+    result_state(list(
+      data = data.table(Message = message),
+      criteria = criteria,
+      show_table = FALSE,
+      message = message,
+      error = FALSE
+    ))
+
+    p <- catalogue_promise
+    if (is.null(p)) {
+      set_search_error(criteria, "Search failed: Eurostat catalogue download has not started.")
+      return(invisible(NULL))
+    }
+
+    promises::then(
+      p,
+      onFulfilled = function(dt) {
+        if (identical(serial, search_serial)) complete_search(dt, criteria)
+        NULL
+      },
+      onRejected = function(e) {
+        if (identical(serial, search_serial)) {
+          set_search_error(criteria, paste("Search failed:", conditionMessage(e)))
+        }
+        NULL
+      }
+    )
+
+    invisible(NULL)
+  }
+
+  run_search <- function(criteria) {
+    if (exists("ensure_r_tempdir", mode = "function")) ensure_r_tempdir()
+    search_serial <<- search_serial + 1L
+    serial <- search_serial
+
+    if (!criteria_has_terms(criteria)) {
+      set_prompt_state(criteria)
+      return(invisible(NULL))
+    }
+
+    start_catalogue_download()
+
+    err <- catalogue_error()
+    if (!is.null(err)) {
+      set_search_error(criteria, paste("Search failed:", err))
+      return(invisible(NULL))
+    }
+
+    cached <- catalogue_cache()
+    if (!is.null(cached)) {
+      complete_search(cached, criteria)
+      return(invisible(NULL))
+    }
+
+    queue_search_after_catalogue(criteria, serial)
+  }
+
+  start_catalogue_download()
 
   observeEvent(input$searchCriteria, {
     run_search(criteria_from_payload(input$searchCriteria))
