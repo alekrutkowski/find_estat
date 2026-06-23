@@ -4,7 +4,9 @@
 
 A small **[R](https://www.r-project.org/)/[Shiny](https://CRAN.R-project.org/package=shiny)** app for quickly finding relevant Eurostat datasets and tables by searching the Eurostat catalogue, the Eurostat data-group hierarchy, dataset/table names, and dataset/table codes.
 
-The app is meant for users who know roughly what they want to study, but do not yet know the exact Eurostat dataset code. It returns matching codes, qualitative size classes, update metadata, direct Eurostat Data Browser links, and one-click `explain` links that open a ChatGPT prompt for the selected code.
+The app is meant for users who know roughly what they want to study, but do not yet know the exact Eurostat dataset code. It returns matching codes, qualitative size classes, update metadata, direct Eurostat Data Browser links, and one-click `explain` links that open a ChatGPT prompt for the selected code.<br></br>
+
+<img width="3330" height="2253" alt="image" src="https://github.com/user-attachments/assets/37ffb393-83ee-4f11-8b5a-20576fa4aa6c" />     
 
 ## What it does
 
