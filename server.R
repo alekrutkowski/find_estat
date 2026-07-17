@@ -6,11 +6,7 @@ library(DT)
 library(promises)
 library(mirai)
 
-default_mirai_daemons <- function() {
-  cores <- parallel::detectCores(logical = FALSE)
-  if (is.na(cores) || cores < 2L) return(1L)
-  max(1L, min(4L, cores - 1L))
-}
+default_mirai_daemons <- function() 1L
 
 configured_daemons <- suppressWarnings(as.integer(Sys.getenv(
   "FIND_ESTAT_MIRAI_DAEMONS",
@@ -163,7 +159,7 @@ read_toc <- function(url = TOC_URL) {
 
     dt <- as.data.table(parsed$dt)
     normalise_toc_names(dt)
-    if (has_toc_columns(dt)) return(dt[])
+    if (has_toc_columns(dt)) return(dt)
 
     errors <- c(
       errors,
@@ -185,7 +181,7 @@ paste_columns <- function(dt, cols) {
 }
 
 encode_url_piece <- function(x) {
-  vapply(trim_text(x), utils::URLencode, character(1L), reserved = TRUE, USE.NAMES = FALSE)
+  utils::URLencode(trim_text(x), reserved = TRUE)
 }
 
 make_browser_url <- function(code) {
@@ -229,7 +225,8 @@ build_catalogue <- function(url = TOC_URL) {
   }
 
   keep <- raw$type_clean %chin% c("dataset", "table")
-  hierarchy <- hierarchy[raw[keep, .(id)], on = "id"]
+  leaf <- raw[keep]
+  hierarchy <- hierarchy[keep]
   hierarchy[, id := NULL]
 
   if (length(level_cols)) {
@@ -240,7 +237,7 @@ build_catalogue <- function(url = TOC_URL) {
     hierarchy[, `Dataset name` := raw[keep, title_clean]]
   }
 
-  meta <- raw[keep, .(
+  meta <- leaf[, .(
     Code = trim_text(code),
     Size = classify_size(ValuesCount),
     `Last update of data` = format_toc_date(LastUpdateDate),
@@ -262,7 +259,12 @@ build_catalogue <- function(url = TOC_URL) {
     names(hierarchy), "Code", "Size", "Last update of data", "Last table structure change",
     "Data start", "Data end", "Link", "Explain", INTERNAL_COLUMNS
   ))
-  out[]
+  setorderv(
+    out,
+    c("LastUpdateDate", "Code"),
+    order = c(-1L, 1L),
+    na.last = TRUE
+  )
 }
 
 catalogue_worker_environment <- function() {
@@ -346,18 +348,27 @@ filter_catalogue <- function(dt, criteria) {
   code_terms <- split_terms(criteria$code)
   exclude_terms <- split_terms(criteria$exclude)
 
-  if (length(whole_terms)) keep <- keep & has_all_terms(dt$SearchTextLower, whole_terms)
-  if (length(code_terms)) keep <- keep & has_any_term(dt$CodeLower, code_terms)
-  if (length(exclude_terms)) keep <- keep & !has_any_term(dt$SearchTextLower, exclude_terms)
+  if (length(whole_terms))
+    keep <- keep & has_all_terms(dt$SearchTextLower, whole_terms)
 
-  ans <- copy(dt[keep])
+  if (length(code_terms))
+    keep <- keep & has_any_term(dt$CodeLower, code_terms)
+
+  if (length(exclude_terms))
+    keep <- keep & !has_any_term(dt$SearchTextLower, exclude_terms)
+
+  visible_cols <- setdiff(names(dt), INTERNAL_COLUMNS)
+  ans <- dt[keep, ..visible_cols]
+
   if (nrow(ans)) {
-    setorderv(ans, c("LastUpdateDate", "Code"), order = c(-1L, 1L), na.last = TRUE)
-    ans[, No := .I]
-    ans[, `Duplicated?` := duplicated(Code)]
+    ans[, `:=`(
+      No = .I,
+      `Duplicated?` = duplicated(Code)
+    )]
     setcolorder(ans, c("No", setdiff(names(ans), "No")))
   }
-  ans[]
+
+  ans
 }
 
 drop_internal_columns <- function(dt) {
@@ -380,22 +391,44 @@ make_anchor <- function(url, text) {
   sprintf('<a href="%s" target="_blank" rel="noopener noreferrer">%s</a>', url, text)
 }
 
-make_display <- function(dt) {
-  if (identical(dt, SEARCH_PROMPT)) return(data.table(Message = SEARCH_PROMPT))
-  if (identical(names(dt), "Message")) return(as.data.table(copy(dt)))
-  if (!nrow(dt)) return(data.table(Message = "Nothing found"))
+nonempty_column_names <- function(dt) {
+  cols <- setdiff(names(dt), INTERNAL_COLUMNS)
 
-  out <- copy(dt)
-  drop_internal_columns(out)
-  out <- drop_empty_columns(out)
+  cols[vapply(cols, function(col) {
+    x <- dt[[col]]
+
+    is.numeric(x) ||
+      is.logical(x) ||
+      inherits(x, "Date") ||
+      any(nzchar(trim_text(x)))
+  }, logical(1L))]
+}
+
+make_display <- function(dt) {
+  if (identical(dt, SEARCH_PROMPT))
+    return(data.table(Message = SEARCH_PROMPT))
+
+  if (identical(names(dt), "Message"))
+    return(as.data.table(dt))
+
+  if (!nrow(dt))
+    return(data.table(Message = "Nothing found"))
+
+  cols <- nonempty_column_names(dt)
+  out <- dt[, ..cols]
 
   if ("Dataset name" %chin% names(out)) {
-    out[, `Dataset name` := paste0("<b>", htmltools::htmlEscape(`Dataset name`), "</b>")]
+    out[, `Dataset name` :=
+      paste0("<b>", htmltools::htmlEscape(`Dataset name`), "</b>")]
   }
-  if ("Link" %chin% names(out)) out[, Link := make_anchor(Link, "link")]
-  if ("Explain" %chin% names(out)) out[, Explain := make_anchor(Explain, "explain")]
 
-  out[]
+  if ("Link" %chin% names(out))
+    out[, Link := make_anchor(Link, "link")]
+
+  if ("Explain" %chin% names(out))
+    out[, Explain := make_anchor(Explain, "explain")]
+
+  out
 }
 
 make_download <- function(dt) {
