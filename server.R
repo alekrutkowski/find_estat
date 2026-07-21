@@ -190,7 +190,7 @@ make_browser_url <- function(code) {
 
 make_explain_url <- function(code) {
   paste0(
-    "https://chatgpt.com/?prompt=Explain+what+the+eurostat+dataset+%22",
+    "https://chat.mistral.ai/chat?q=Explain+what+the+Eurostat+dataset+%22",
     encode_url_piece(code),
     "%22+is+about+and+what+questions+I+can+use+it+for%2E"
   )
